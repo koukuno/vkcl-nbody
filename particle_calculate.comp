@@ -1,0 +1,72 @@
+/*
+ * Copyright (c) 2016 Sascha Willems
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+#version 450
+
+layout(local_size_x = 1024) in;
+
+struct Particle {
+	vec4 position;
+	vec4 velocity;
+};
+
+layout(binding = 0, std430) buffer ParticleBuffer {
+	Particle particles[];
+};
+
+layout(binding = 1) uniform UBO {
+	float delta_time;
+	uint particle_count;
+} ubo;
+
+layout(constant_id = 0) const int SHARED_DATA_SIZE = 1024;
+layout(constant_id = 1) const float GRAVITY = 0.002;
+layout(constant_id = 2) const float POWER = 0.75;
+layout(constant_id = 3) const float SOFTEN = 0.0075;
+
+shared vec4 shared_data[SHARED_DATA_SIZE];
+
+void main() {
+	uint i = gl_GlobalInvocationID.x;
+
+	vec4 position = particles[i].position;
+	vec4 acceleration = vec4(0.0);
+
+	for (uint j = 0; j < ubo.particle_count; j += SHARED_DATA_SIZE) {
+		shared_data[i] = particles[i + j].position;
+
+		memoryBarrierShared();
+		barrier();
+
+		for (uint k = 0; k < gl_WorkGroupSize.x; k++) {
+			vec4 other = particles[i + j].position;
+			vec3 len = other.xyz - position.xyz;
+			acceleration.xyz += GRAVITY*len*other.w / pow(dot(len, len) + SOFTEN, POWER);
+		}
+
+		memoryBarrierShared();
+		barrier();
+	}
+
+	particles[i].velocity.xyz += ubo.delta_time*acceleration.xyz;
+	particles[i].position = ubo.delta_time*particles[i].velocity;
+}
