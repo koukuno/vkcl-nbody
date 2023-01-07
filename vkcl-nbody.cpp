@@ -805,6 +805,9 @@ int main() {
 	std::chrono::high_resolution_clock::time_point start_time, end_time;
 	StdinMailbox mailbox;
 	std::string line;
+	float duration = 0.f, mean_sample = 0.f;
+	int num_samples = 0;
+
 	while (true) {
 		if (mailbox.get_input(line)) {
 			if (line == "quit")
@@ -831,6 +834,22 @@ int main() {
 
 		end_time = std::chrono::high_resolution_clock::now();
 		ubo->delta_time = std::chrono::duration_cast<std::chrono::duration<float>>(end_time - start_time).count();
+
+		duration += ubo->delta_time;
+		mean_sample += ubo->delta_time;
+		num_samples++;
+
+		if (duration >= 10.f) {
+			duration = 0.f;
+
+			const auto t = time(NULL);
+			const std::tm *timest = std::localtime(&t);
+			const float avg_dt = mean_sample/num_samples, avg_bps = 1.f/avg_dt;
+			mean_sample = 0.f;
+			num_samples = 0;
+
+			std::printf("DateTime:%d-%02d-%02d %02d:%02d:%02d AverageBodiesPerSecond (AverageBPS):%.02f\n", 1900 + timest->tm_year, 1 + timest->tm_mon, timest->tm_mday, timest->tm_hour, timest->tm_min, timest->tm_sec, avg_bps);
+		}
 
 		if (funcs.vkResetFences(dev, 1, &fence) != VK_SUCCESS)
 			throw std::runtime_error("Failed to reset fence!");
