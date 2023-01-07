@@ -40,6 +40,7 @@
 #include <stdexcept>
 #include <cstdio>
 #include <iostream>
+#include <cstring>
 
 #include "volk.h"
 
