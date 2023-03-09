@@ -131,6 +131,7 @@ static VkBool32 vulkan_debug_utils_messenger(VkDebugUtilsMessageSeverityFlagBits
 	return VK_FALSE;
 }
 
+#if 0
 // return the index of the device that the user chose if there are multiple. otherwise select the first device
 static int select_device_prompt(const std::vector<VkPhysicalDevice> &physical_devs) {
 	const auto print_physical_devices = [](const std::vector<std::string> &names, const std::vector<bool> &on_pci, const std::vector<VkPhysicalDevicePCIBusInfoPropertiesEXT> &pci_bus_infos, const std::vector<VkPhysicalDeviceProperties> &props) {
@@ -203,6 +204,7 @@ static int select_device_prompt(const std::vector<VkPhysicalDevice> &physical_de
 
 	return idx;
 }
+#endif
 
 static void create_vkinstance(VkInstance &inst, VkDebugUtilsMessengerEXT &debug_msgr, const bool debug_mode) {
 	static const std::array<const char *, 2> supp_layer_names = {
@@ -802,100 +804,43 @@ int main() {
 
 	VkInstance inst;
 	VkDebugUtilsMessengerEXT debug_msgr = VK_NULL_HANDLE;
-	std::vector<VkPhysicalDevice> physical_devs;
-	VkPhysicalDevice physical_dev;
-
-	VkDevice dev;
-	VolkDeviceTable funcs;
-	VmaAllocator allocator;
-
-	VkDescriptorSetLayout desc_set_layout;
-	VkPipelineLayout pipeline_layout;
-	VkPipeline pipeline_calculate, pipeline_integrate;
-
-	VkDescriptorPool desc_pool;
-	VkDescriptorSet desc_set;
-
-	VmaAllocation dev_buf_alloc, host_buf_alloc, uniform_buf_alloc;
-	VkBuffer dev_buf, host_buf, uniform_buf;
-	Particle *particles; // from host_buf memory
-	UBO *ubo; // from uniform_buf memory
-
-	VkCommandPool cmd_pool;
-	std::array<VkCommandBuffer, 2> cmd_bufs;
-
-	VkFence fence;
-
-	std::uint32_t compute_queue_family_idx;
-	VkQueue compute_queue;
+	std::vector<VkPhysicalDevice> present_physical_devs, physical_devs;
 
 	create_vkinstance(inst, debug_msgr, false);
-	get_physical_devs(inst, physical_devs);
-	physical_dev = physical_devs[select_device_prompt(physical_devs)];
+	get_physical_devs(inst, present_physical_devs);
+	//physical_dev = physical_devs[select_device_prompt(physical_devs)];
 
-	create_device(physical_dev, dev, compute_queue_family_idx);
-	volkLoadDeviceTable(&funcs, dev);
-	funcs.vkGetDeviceQueue(dev, compute_queue_family_idx, 0, &compute_queue);
-	create_allocator(funcs, inst, physical_dev, dev, allocator);
-
-	create_desc_and_pipeline_layout(funcs, dev, desc_set_layout, pipeline_layout);
-	create_compute_pipeline(funcs, dev, pipeline_layout, particle_calculate_code, sizeof(particle_calculate_code), pipeline_calculate);
-	create_compute_pipeline(funcs, dev, pipeline_layout, particle_integrate_code, sizeof(particle_integrate_code), pipeline_integrate);
-	create_desc_pool_and_set(funcs, dev, desc_set_layout, desc_pool, desc_set);
-
-	create_dev_buf(allocator, dev_buf, dev_buf_alloc, storage_buf_size + uniform_buf_size);
-	create_host_buf(allocator, host_buf, host_buf_alloc, particles, storage_buf_size);
-	create_uniform_buf(allocator, uniform_buf, uniform_buf_alloc, ubo, uniform_buf_size);
-	update_desc_set(funcs, dev, desc_set, dev_buf, uniform_buf, storage_buf_size, uniform_buf_size);
-
-	create_cmd_pool(funcs, dev, compute_queue_family_idx, cmd_pool);
-	create_cmd_bufs(funcs, dev, cmd_pool, cmd_bufs);
-	record_cmd_buf_work(funcs, cmd_bufs[0], pipeline_calculate, pipeline_integrate, pipeline_layout, desc_set, dev_buf, storage_buf_size, count);
-	record_cmd_buf_copy(funcs, cmd_bufs[1], host_buf, dev_buf, storage_buf_size);
-
-	create_fence(funcs, dev, fence);
-
-	printf("Creating random init data...\n");
-	for (std::size_t i = 0; i < num_particles; i++) {
-		particles[i].position.components.x = dist(rng);
-		particles[i].position.components.y = dist(rng);
-		particles[i].position.components.z = dist(rng);
-		particles[i].position.components.w = dist(rng);
-
-		particles[i].velocity.components.x = dist(rng);
-		particles[i].velocity.components.y = dist(rng);
-		particles[i].velocity.components.z = dist(rng);
-		particles[i].velocity.components.w = dist(rng);
+	for (std::size_t i = 0; i < present_physical_devs.size(); i++) {
+		VkPhysicalDeviceProperties props;
+		vkGetPhysicalDeviceProperties(present_physical_devs[i], &props);
+		std::printf("%x:%x\n", props.vendorID, props.deviceID);
+		if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) // do not use CPUs
+			physical_devs.push_back(present_physical_devs[i]);
 	}
 
-	// copy init data
-	{
-		printf("Copying init data...\n");
+	std::vector<VkDevice> dev(physical_devs.size());
+	std::vector<VolkDeviceTable> funcs(physical_devs.size());
+	std::vector<VmaAllocator> allocator(physical_devs.size());
 
-		const VkSubmitInfo submit_info = {
-			.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-			.pNext = nullptr,
-			.waitSemaphoreCount = 0,
-			.pWaitSemaphores = nullptr,
-			.commandBufferCount = 1,
-			.pCommandBuffers = &cmd_bufs[1],
-			.signalSemaphoreCount = 0,
-			.pSignalSemaphores = nullptr
-		};
+	std::vector<VkDescriptorSetLayout> desc_set_layout(physical_devs.size());
+	std::vector<VkPipelineLayout> pipeline_layout(physical_devs.size());
+	std::vector<VkPipeline> pipeline_calculate(physical_devs.size()), pipeline_integrate(physical_devs.size());
 
-		if (funcs.vkQueueSubmit(compute_queue, 1, &submit_info, fence) != VK_SUCCESS)
-			throw std::runtime_error("Cannot copy init data!");
+	std::vector<VkDescriptorPool> desc_pool(physical_devs.size());
+	std::vector<VkDescriptorSet> desc_set(physical_devs.size());
 
-		if (funcs.vkWaitForFences(dev, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()) != VK_SUCCESS)
-			throw std::runtime_error("Failed to wait for fence! (copy completion)");
+	std::vector<VmaAllocation> dev_buf_alloc(physical_devs.size()), host_buf_alloc(physical_devs.size()), uniform_buf_alloc(physical_devs.size());
+	std::vector<VkBuffer> dev_buf(physical_devs.size()), host_buf(physical_devs.size()), uniform_buf(physical_devs.size());
+	std::vector<Particle *> particles(physical_devs.size()); // from host_buf memory
+	std::vector<UBO *> ubo(physical_devs.size()); // from uniform_buf memory
 
-		if (funcs.vkResetFences(dev, 1, &fence) != VK_SUCCESS)
-			throw std::runtime_error("Failed to reset fence!");
-	}
+	std::vector<VkCommandPool> cmd_pool(physical_devs.size());
+	std::vector<std::array<VkCommandBuffer, 2>> cmd_bufs(physical_devs.size());
 
-	ubo->particle_count = num_particles;
+	std::vector<VkFence> fence(physical_devs.size());
 
-	printf("Enter quit to end the program.\n");
+	std::vector<std::uint32_t> compute_queue_family_idx(physical_devs.size());
+	std::vector<VkQueue> compute_queue(physical_devs.size());
 
 	std::chrono::high_resolution_clock::time_point start_time, end_time;
 	StdinMailbox mailbox;
@@ -903,69 +848,151 @@ int main() {
 	float duration = 0.f, mean_sample = 0.f;
 	int num_samples = 0;
 
+	for (std::size_t i = 0; i < physical_devs.size(); i++) {
+		create_device(physical_devs[i], dev[i], compute_queue_family_idx[i]);
+		volkLoadDeviceTable(&funcs[i], dev[i]);
+		funcs[i].vkGetDeviceQueue(dev[i], compute_queue_family_idx[i], 0, &compute_queue[i]);
+		create_allocator(funcs[i], inst, physical_devs[i], dev[i], allocator[i]);
+	}
+
+	for (std::size_t i = 0; i < physical_devs.size(); i++) {
+		create_desc_and_pipeline_layout(funcs[i], dev[i], desc_set_layout[i], pipeline_layout[i]);
+		create_compute_pipeline(funcs[i], dev[i], pipeline_layout[i], particle_calculate_code, sizeof(particle_calculate_code), pipeline_calculate[i]);
+		create_compute_pipeline(funcs[i], dev[i], pipeline_layout[i], particle_integrate_code, sizeof(particle_integrate_code), pipeline_integrate[i]);
+		create_desc_pool_and_set(funcs[i], dev[i], desc_set_layout[i], desc_pool[i], desc_set[i]);
+
+		create_dev_buf(allocator[i], dev_buf[i], dev_buf_alloc[i], storage_buf_size + uniform_buf_size);
+		create_host_buf(allocator[i], host_buf[i], host_buf_alloc[i], particles[i], storage_buf_size);
+		create_uniform_buf(allocator[i], uniform_buf[i], uniform_buf_alloc[i], ubo[i], uniform_buf_size);
+		update_desc_set(funcs[i], dev[i], desc_set[i], dev_buf[i], uniform_buf[i], storage_buf_size, uniform_buf_size);
+
+		create_cmd_pool(funcs[i], dev[i], compute_queue_family_idx[i], cmd_pool[i]);
+		create_cmd_bufs(funcs[i], dev[i], cmd_pool[i], cmd_bufs[i]);
+		record_cmd_buf_work(funcs[i], cmd_bufs[i][0], pipeline_calculate[i], pipeline_integrate[i], pipeline_layout[i], desc_set[i], dev_buf[i], storage_buf_size, count);
+		record_cmd_buf_copy(funcs[i], cmd_bufs[i][1], host_buf[i], dev_buf[i], storage_buf_size);
+
+		create_fence(funcs[i], dev[i], fence[i]);
+	}
+
+	for (std::size_t i = 0; i < physical_devs.size(); i++) {
+		printf("Creating random init data...\n");
+		for (std::size_t j = 0; j < num_particles; j++) {
+			particles[i][j].position.components.x = dist(rng);
+			particles[i][j].position.components.y = dist(rng);
+			particles[i][j].position.components.z = dist(rng);
+			particles[i][j].position.components.w = dist(rng);
+
+			particles[i][j].velocity.components.x = dist(rng);
+			particles[i][j].velocity.components.y = dist(rng);
+			particles[i][j].velocity.components.z = dist(rng);
+			particles[i][j].velocity.components.w = dist(rng);
+		}
+
+		// copy init data
+		{
+			printf("Copying init data...\n");
+
+			const VkSubmitInfo submit_info = {
+				.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+				.pNext = nullptr,
+				.waitSemaphoreCount = 0,
+				.pWaitSemaphores = nullptr,
+				.commandBufferCount = 1,
+				.pCommandBuffers = &cmd_bufs[i][1],
+				.signalSemaphoreCount = 0,
+				.pSignalSemaphores = nullptr
+			};
+
+			if (funcs[i].vkQueueSubmit(compute_queue[i], 1, &submit_info, fence[i]) != VK_SUCCESS)
+				throw std::runtime_error("Cannot copy init data!");
+
+			if (funcs[i].vkWaitForFences(dev[i], 1, &fence[i], VK_TRUE, std::numeric_limits<std::uint64_t>::max()) != VK_SUCCESS)
+				throw std::runtime_error("Failed to wait for fence! (copy completion)");
+
+			if (funcs[i].vkResetFences(dev[i], 1, &fence[i]) != VK_SUCCESS)
+				throw std::runtime_error("Failed to reset fence!");
+		}
+
+		ubo[i]->particle_count = num_particles;
+	}
+
+	printf("Enter quit to end the program.\n");
+
 	while (true) {
 		if (mailbox.get_input(line)) {
 			if (line == "quit")
 				break;
 		}
 
-		const VkSubmitInfo submit_info = {
-			.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-			.pNext = nullptr,
-			.waitSemaphoreCount = 0,
-			.pWaitSemaphores = nullptr,
-			.commandBufferCount = 1,
-			.pCommandBuffers = &cmd_bufs[0],
-			.signalSemaphoreCount = 0,
-			.pSignalSemaphores = nullptr
-		};
+		for (std::size_t i = 0; i < physical_devs.size(); i++) {
+			const VkSubmitInfo submit_info = {
+				.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+				.pNext = nullptr,
+				.waitSemaphoreCount = 0,
+				.pWaitSemaphores = nullptr,
+				.commandBufferCount = 1,
+				.pCommandBuffers = &cmd_bufs[i][0],
+				.signalSemaphoreCount = 0,
+				.pSignalSemaphores = nullptr
+			};
 
-		funcs.vkQueueSubmit(compute_queue, 1, &submit_info, fence);
+			funcs[i].vkQueueSubmit(compute_queue[i], 1, &submit_info, fence[i]);
 
-		start_time = std::chrono::high_resolution_clock::now();
+			start_time = std::chrono::high_resolution_clock::now();
 
-		if (funcs.vkWaitForFences(dev, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()) != VK_SUCCESS)
-			throw std::runtime_error("Failed to wait for fence! (copy completion)");
+			if (funcs[i].vkWaitForFences(dev[i], 1, &fence[i], VK_TRUE, std::numeric_limits<std::uint64_t>::max()) != VK_SUCCESS)
+				throw std::runtime_error("Failed to wait for fence! (work completion)");
 
-		end_time = std::chrono::high_resolution_clock::now();
-		ubo->delta_time = std::chrono::duration_cast<std::chrono::duration<float>>(end_time - start_time).count();
+			end_time = std::chrono::high_resolution_clock::now();
+			ubo[i]->delta_time = std::chrono::duration_cast<std::chrono::duration<float>>(end_time - start_time).count();
 
-		duration += ubo->delta_time;
-		mean_sample += ubo->delta_time;
-		num_samples++;
+			duration += ubo[i]->delta_time;
+			mean_sample += ubo[i]->delta_time;
+			num_samples++;
 
-		if (duration >= 10.f) {
-			duration = 0.f;
+			if (duration >= 10.f) {
+				duration = 0.f;
 
-			const auto t = time(NULL);
-			const std::tm *timest = std::localtime(&t);
-			const float avg_dt = mean_sample/num_samples, avg_bps = 1.f/avg_dt;
-			mean_sample = 0.f;
-			num_samples = 0;
+				const auto t = time(NULL);
+				const std::tm* timest = std::localtime(&t);
+				const float avg_dt = mean_sample / num_samples, avg_bps = 1.f / avg_dt;
+				mean_sample = 0.f;
+				num_samples = 0;
 
-			std::printf("DateTime:%d-%02d-%02d %02d:%02d:%02d AverageBodiesPerSecond (AverageBPS):%.02f\n", 1900 + timest->tm_year, 1 + timest->tm_mon, timest->tm_mday, timest->tm_hour, timest->tm_min, timest->tm_sec, avg_bps);
+				std::printf("DateTime:%d-%02d-%02d %02d:%02d:%02d AverageBodiesPerSecond (AverageBPS):%.02f\n", 1900 + timest->tm_year, 1 + timest->tm_mon, timest->tm_mday, timest->tm_hour, timest->tm_min, timest->tm_sec, avg_bps);
+			}
+
+			if (funcs[i].vkResetFences(dev[i], 1, &fence[i]) != VK_SUCCESS)
+				throw std::runtime_error("Failed to reset fence!");
 		}
-
-		if (funcs.vkResetFences(dev, 1, &fence) != VK_SUCCESS)
-			throw std::runtime_error("Failed to reset fence!");
 	}
 
-	funcs.vkDeviceWaitIdle(dev);
-	funcs.vkDestroyFence(dev, fence, nullptr);
-	funcs.vkDestroyCommandPool(dev, cmd_pool, nullptr);
+	for (std::size_t i = 0; i < physical_devs.size(); i++)
+		funcs[i].vkDeviceWaitIdle(dev[i]);
 
-	vmaDestroyBuffer(allocator, uniform_buf, uniform_buf_alloc);
-	vmaDestroyBuffer(allocator, host_buf, host_buf_alloc);
-	vmaDestroyBuffer(allocator, dev_buf, dev_buf_alloc);
+	for (std::size_t i = 0; i < physical_devs.size(); i++) {
+		funcs[i].vkDestroyFence(dev[i], fence[i], nullptr);
+		funcs[i].vkDestroyCommandPool(dev[i], cmd_pool[i], nullptr);
+	}
 
-	funcs.vkDestroyDescriptorPool(dev, desc_pool, nullptr);
-	funcs.vkDestroyPipeline(dev, pipeline_calculate, nullptr);
-	funcs.vkDestroyPipeline(dev, pipeline_integrate, nullptr);
-	funcs.vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
-	funcs.vkDestroyDescriptorSetLayout(dev, desc_set_layout, nullptr);
+	for (std::size_t i = 0; i < physical_devs.size(); i++) {
+		vmaDestroyBuffer(allocator[i], uniform_buf[i], uniform_buf_alloc[i]);
+		vmaDestroyBuffer(allocator[i], host_buf[i], host_buf_alloc[i]);
+		vmaDestroyBuffer(allocator[i], dev_buf[i], dev_buf_alloc[i]);
+	}
 
-	vmaDestroyAllocator(allocator);
-	funcs.vkDestroyDevice(dev, nullptr);
+	for (std::size_t i = 0; i < physical_devs.size(); i++) {
+		funcs[i].vkDestroyDescriptorPool(dev[i], desc_pool[i], nullptr);
+		funcs[i].vkDestroyPipeline(dev[i], pipeline_calculate[i], nullptr);
+		funcs[i].vkDestroyPipeline(dev[i], pipeline_integrate[i], nullptr);
+		funcs[i].vkDestroyPipelineLayout(dev[i], pipeline_layout[i], nullptr);
+		funcs[i].vkDestroyDescriptorSetLayout(dev[i], desc_set_layout[i], nullptr);
+	}
+
+	for (std::size_t i = 0; i < physical_devs.size(); i++) {
+		vmaDestroyAllocator(allocator[i]);
+		funcs[i].vkDestroyDevice(dev[i], nullptr);
+	}
 
 	if (debug_msgr != VK_NULL_HANDLE)
 		vkDestroyDebugUtilsMessengerEXT(inst, debug_msgr, nullptr);
