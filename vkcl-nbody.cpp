@@ -41,6 +41,7 @@
 #include <cstdio>
 #include <iostream>
 #include <cstring>
+#include <set>
 
 #include "volk.h"
 
@@ -119,6 +120,17 @@ bool StdinMailbox::get_input(std::string &o_line) {
 	return true;
 }
 
+static VkBool32 vulkan_debug_utils_messenger(VkDebugUtilsMessageSeverityFlagBitsEXT msg_severity, VkDebugUtilsMessageTypeFlagsEXT msg_type, const VkDebugUtilsMessengerCallbackDataEXT* callback_data, void* user_data) {
+	(void)msg_severity;
+	(void)msg_type;
+	(void)user_data;
+
+	if (msg_type >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
+		std::printf("VulkanAPI: %s\n", callback_data->pMessage);
+
+	return VK_FALSE;
+}
+
 // return the index of the device that the user chose if there are multiple. otherwise select the first device
 static int select_device_prompt(const std::vector<VkPhysicalDevice> &physical_devs) {
 	const auto print_physical_devices = [](const std::vector<std::string> &names, const std::vector<bool> &on_pci, const std::vector<VkPhysicalDevicePCIBusInfoPropertiesEXT> &pci_bus_infos, const std::vector<VkPhysicalDeviceProperties> &props) {
@@ -161,12 +173,11 @@ static int select_device_prompt(const std::vector<VkPhysicalDevice> &physical_de
 		};
 
 		VkPhysicalDeviceProperties2KHR props = {
-			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR,
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2_KHR,
 			.pNext = on_pci[i] ? &pci_bus_info : nullptr,
 			.properties = {}
 		};
 
-		props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR;
 		vkGetPhysicalDeviceProperties2KHR(physical_devs[i], &props);
 
 		pci_bus_infos[i] = pci_bus_info;
@@ -193,36 +204,121 @@ static int select_device_prompt(const std::vector<VkPhysicalDevice> &physical_de
 	return idx;
 }
 
-static void create_vkinstance(VkInstance &inst) {
-	static const std::array<const char *, 1> extensions = {
-		VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME
+static void create_vkinstance(VkInstance &inst, VkDebugUtilsMessengerEXT &debug_msgr, const bool debug_mode) {
+	static const std::array<const char *, 2> supp_layer_names = {
+		"VK_LAYER_KHRONOS_validation",
+		"VK_LAYER_KHRONOS_synchronization2"
 	};
 
-	const VkApplicationInfo app_info = {
+	static const std::array<VkValidationFeatureEnableEXT, 4> valid_enable = {
+		VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT,
+		VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_RESERVE_BINDING_SLOT_EXT,
+		VK_VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT,
+		VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
+	};
+
+	static const VkApplicationInfo app_info = {
 		.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
 		.pNext = nullptr,
-		.pApplicationName = "vkcl-nbody",
-		.applicationVersion = VK_MAKE_VERSION(1, 0, 0),
-		.pEngineName = "vkcl-nbody",
-		.engineVersion = VK_MAKE_VERSION(1, 0, 0),
+		.pApplicationName = "Voka",
+		.applicationVersion = VK_MAKE_API_VERSION(0, 0, 1, 0),
+		.pEngineName = "VokaNN",
+		.engineVersion = VK_MAKE_API_VERSION(0, 0, 1, 0),
 		.apiVersion = VK_API_VERSION_1_0
 	};
 
-	const VkInstanceCreateInfo create_info = {
-		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+	static const VkDebugUtilsMessengerCreateInfoEXT dbg_msgr_create_info = {
+		.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
 		.pNext = nullptr,
 		.flags = 0,
+		.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+		.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+		.pfnUserCallback = vulkan_debug_utils_messenger,
+		.pUserData = nullptr
+	};
+
+	static const VkValidationFeaturesEXT valid_features = {
+		.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT,
+		.pNext = &dbg_msgr_create_info,
+		.enabledValidationFeatureCount = static_cast<std::uint32_t>(valid_enable.size()),
+		.pEnabledValidationFeatures = valid_enable.data(),
+		.disabledValidationFeatureCount = 0,
+		.pDisabledValidationFeatures = nullptr
+	};
+
+	std::vector<VkLayerProperties> avail_layer_props;
+	std::uint32_t vk_obj_count;
+
+	std::set<const char *> layers_support, exts_support = { VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME };
+	std::vector<const char *> layers_enable, exts_enable;
+
+	if (volkInitialize() != VK_SUCCESS)
+		throw std::runtime_error("Cannot init volk!");
+
+	vkEnumerateInstanceLayerProperties(&vk_obj_count, nullptr);
+	avail_layer_props.resize(vk_obj_count);
+	vkEnumerateInstanceLayerProperties(&vk_obj_count, avail_layer_props.data());
+
+	for (const auto& avail_layer : avail_layer_props) {
+		const std::string_view avail_layer_name(avail_layer.layerName);
+
+		for (const auto& supp_layer_name : supp_layer_names) {
+			if (avail_layer_name == supp_layer_name)
+				layers_support.insert(supp_layer_name);
+		}
+	}
+
+	bool supp_debug_mode = false, search_valid_layer = false;
+
+	for (const auto &layer_ptr : layers_support) {
+		const std::string_view layer(layer_ptr);
+		const auto is_validation_layer = search_valid_layer = layer == "VK_LAYER_KHRONOS_validation";
+
+		if (is_validation_layer && debug_mode) {
+			exts_support.insert(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+			exts_support.insert(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
+			std::printf("!! Vulkan Validation Layers Enabled\n");
+			supp_debug_mode = true;
+			break;
+		} else if (is_validation_layer && !debug_mode) {
+			layers_support.erase("VK_LAYER_KHRONOS_validation");
+			break;
+		}
+	}
+
+	if (!search_valid_layer && debug_mode)
+		std::printf("!! Vulkan Validation Layers requested, but not found");
+
+	if (layers_support.size() > 0) {
+		layers_enable.resize(layers_support.size());
+		std::copy(layers_support.begin(), layers_support.end(), layers_enable.begin());
+	}
+
+	if (exts_support.size() > 0) {
+		exts_enable.resize(exts_support.size());
+		std::copy(exts_support.begin(), exts_support.end(), exts_enable.begin());
+	}
+
+	const VkInstanceCreateInfo create_info = {
+		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+		.pNext = supp_debug_mode ? &valid_features : nullptr,
+		.flags = 0,
 		.pApplicationInfo = &app_info,
-		.enabledLayerCount = 0,
-		.ppEnabledLayerNames = nullptr,
-		.enabledExtensionCount = static_cast<std::uint32_t>(extensions.size()),
-		.ppEnabledExtensionNames = extensions.data()
+		.enabledLayerCount = static_cast<std::uint32_t>(layers_enable.size()),
+		.ppEnabledLayerNames = layers_enable.size() > 0 ? layers_enable.data() : nullptr,
+		.enabledExtensionCount = static_cast<std::uint32_t>(exts_enable.size()),
+		.ppEnabledExtensionNames = exts_enable.size() > 0 ? exts_enable.data() : nullptr
 	};
 
 	if (vkCreateInstance(&create_info, nullptr, &inst) != VK_SUCCESS)
-		throw std::runtime_error("Failed to create VkInstance!");
+		throw std::runtime_error("Failed to create VkInstance");
 
 	volkLoadInstanceOnly(inst);
+
+	if (supp_debug_mode) {
+		if (vkCreateDebugUtilsMessengerEXT(inst, &dbg_msgr_create_info, nullptr, &debug_msgr) != VK_SUCCESS)
+			throw std::runtime_error("Failed to create VkDebugUtilsMessengerEXT");
+	}
 }
 
 static void get_physical_devs(VkInstance inst, std::vector<VkPhysicalDevice> &physical_devs) {
@@ -705,6 +801,7 @@ int main() {
 	std::uniform_real_distribution<float> dist(0.0, 1000.0);
 
 	VkInstance inst;
+	VkDebugUtilsMessengerEXT debug_msgr = VK_NULL_HANDLE;
 	std::vector<VkPhysicalDevice> physical_devs;
 	VkPhysicalDevice physical_dev;
 
@@ -732,10 +829,7 @@ int main() {
 	std::uint32_t compute_queue_family_idx;
 	VkQueue compute_queue;
 
-	if (volkInitialize() != VK_SUCCESS)
-		throw std::runtime_error("Cannot load Vulkan runtime library!");
-
-	create_vkinstance(inst);
+	create_vkinstance(inst, debug_msgr, false);
 	get_physical_devs(inst, physical_devs);
 	physical_dev = physical_devs[select_device_prompt(physical_devs)];
 
@@ -872,6 +966,9 @@ int main() {
 
 	vmaDestroyAllocator(allocator);
 	funcs.vkDestroyDevice(dev, nullptr);
+
+	if (debug_msgr != VK_NULL_HANDLE)
+		vkDestroyDebugUtilsMessengerEXT(inst, debug_msgr, nullptr);
 
 	vkDestroyInstance(inst, nullptr);
 
