@@ -706,7 +706,6 @@ static void update_desc_set(const VolkDeviceTable &funcs, VkDevice dev, VkDescri
 	funcs.vkUpdateDescriptorSets(dev, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
-#if 0
 static void create_semaphore(const VolkDeviceTable &funcs, VkDevice dev, VkSemaphore &semaphore) {
 	const VkSemaphoreCreateInfo create_info = {
 		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
@@ -717,7 +716,6 @@ static void create_semaphore(const VolkDeviceTable &funcs, VkDevice dev, VkSemap
 	if (funcs.vkCreateSemaphore(dev, &create_info, nullptr, &semaphore) != VK_SUCCESS)
 		throw std::runtime_error("Cannot create VkSemaphore!");
 }
-#endif
 
 static void create_fence(const VolkDeviceTable &funcs, VkDevice dev, VkFence &fence) {
 	const VkFenceCreateInfo create_info = {
@@ -792,11 +790,15 @@ static auto get_random_seed() {
 }
 
 int main() {
-	static const std::uint32_t count = 4096;
+	// TODO: perform heuristics for the ideal value OR let the user specify the "count" variable
+	// Right now, this value of 16384 pushes a 6900 XT and a couple A6000's to the limit.
+	static const std::uint32_t count = 16384;
 	static const std::size_t num_particles = count*1024;
 
 	static const VkDeviceSize storage_buf_size = sizeof(Particle)*num_particles;
 	static const VkDeviceSize uniform_buf_size = sizeof(UBO);
+
+	static const VkPipelineStageFlags wait_stage_transfer = VK_PIPELINE_STAGE_TRANSFER_BIT, wait_stage_compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
 
 	static auto seed = get_random_seed();
 	static std::default_random_engine rng(seed);
@@ -835,15 +837,17 @@ int main() {
 	std::vector<UBO *> ubo(physical_devs.size()); // from uniform_buf memory
 
 	std::vector<VkCommandPool> cmd_pool(physical_devs.size());
-	std::vector<std::array<VkCommandBuffer, 2>> cmd_bufs(physical_devs.size());
+	std::vector<std::array<VkCommandBuffer, 33>> cmd_bufs(physical_devs.size());
+	std::vector<std::array<VkSemaphore, 32>> semaphores(physical_devs.size()), wait_semaphores(physical_devs.size()), fin_semaphores(physical_devs.size());
+	std::vector<std::array<VkSubmitInfo, 32>> submit_infos(physical_devs.size());
 
 	std::vector<VkFence> fence(physical_devs.size());
 
 	std::vector<std::uint32_t> compute_queue_family_idx(physical_devs.size());
 	std::vector<VkQueue> compute_queue(physical_devs.size());
 
-	std::chrono::high_resolution_clock::time_point start_time, end_time;
 	StdinMailbox mailbox;
+	std::chrono::high_resolution_clock::time_point start_time, end_time;
 	std::string line;
 	float duration = 0.f, mean_sample = 0.f;
 	int num_samples = 0;
@@ -868,10 +872,33 @@ int main() {
 
 		create_cmd_pool(funcs[i], dev[i], compute_queue_family_idx[i], cmd_pool[i]);
 		create_cmd_bufs(funcs[i], dev[i], cmd_pool[i], cmd_bufs[i]);
-		record_cmd_buf_work(funcs[i], cmd_bufs[i][0], pipeline_calculate[i], pipeline_integrate[i], pipeline_layout[i], desc_set[i], dev_buf[i], storage_buf_size, count);
-		record_cmd_buf_copy(funcs[i], cmd_bufs[i][1], host_buf[i], dev_buf[i], storage_buf_size);
+
+		record_cmd_buf_copy(funcs[i], cmd_bufs[i][cmd_bufs[i].size() - 1], host_buf[i], dev_buf[i], storage_buf_size);
+		for (std::size_t j = 0; j < cmd_bufs[i].size() - 1; j++)
+			record_cmd_buf_work(funcs[i], cmd_bufs[i][j], pipeline_calculate[i], pipeline_integrate[i], pipeline_layout[i], desc_set[i], dev_buf[i], storage_buf_size, count);
 
 		create_fence(funcs[i], dev[i], fence[i]);
+
+		for (std::size_t j = 0; j < semaphores[i].size(); j++) {
+			create_semaphore(funcs[i], dev[i], semaphores[i][j]);
+			wait_semaphores[i][j] = semaphores[i][j];
+		}
+
+		for (std::size_t j = 0; j < semaphores[i].size(); j++) {
+			fin_semaphores[i][j] = semaphores[i][j + 1 < semaphores[i].size() ? j + 1 : 0];
+
+			submit_infos[i][j] = {
+				.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+				.pNext = nullptr,
+				.waitSemaphoreCount = 1,
+				.pWaitSemaphores = &wait_semaphores[i][j],
+				.pWaitDstStageMask = &wait_stage_compute,
+				.commandBufferCount = 1,
+				.pCommandBuffers = &cmd_bufs[i][j + 1],
+				.signalSemaphoreCount = 1,
+				.pSignalSemaphores = &fin_semaphores[i][j]
+			};
+		}
 	}
 
 	for (std::size_t i = 0; i < physical_devs.size(); i++) {
@@ -897,20 +924,23 @@ int main() {
 				.pNext = nullptr,
 				.waitSemaphoreCount = 0,
 				.pWaitSemaphores = nullptr,
+				.pWaitDstStageMask = nullptr,
 				.commandBufferCount = 1,
-				.pCommandBuffers = &cmd_bufs[i][1],
-				.signalSemaphoreCount = 0,
-				.pSignalSemaphores = nullptr
+				.pCommandBuffers = &cmd_bufs[i][0],
+				.signalSemaphoreCount = 1,
+				.pSignalSemaphores = &wait_semaphores[i][0],
 			};
 
-			if (funcs[i].vkQueueSubmit(compute_queue[i], 1, &submit_info, fence[i]) != VK_SUCCESS)
+			if (funcs[i].vkQueueSubmit(compute_queue[i], 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS)
 				throw std::runtime_error("Cannot copy init data!");
-
+#if 0
 			if (funcs[i].vkWaitForFences(dev[i], 1, &fence[i], VK_TRUE, std::numeric_limits<std::uint64_t>::max()) != VK_SUCCESS)
 				throw std::runtime_error("Failed to wait for fence! (copy completion)");
 
 			if (funcs[i].vkResetFences(dev[i], 1, &fence[i]) != VK_SUCCESS)
 				throw std::runtime_error("Failed to reset fence!");
+#endif
+			submit_infos[i][0].pWaitDstStageMask = &wait_stage_transfer;
 		}
 
 		ubo[i]->particle_count = num_particles;
@@ -925,45 +955,40 @@ int main() {
 		}
 
 		for (std::size_t i = 0; i < physical_devs.size(); i++) {
-			const VkSubmitInfo submit_info = {
-				.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-				.pNext = nullptr,
-				.waitSemaphoreCount = 0,
-				.pWaitSemaphores = nullptr,
-				.commandBufferCount = 1,
-				.pCommandBuffers = &cmd_bufs[i][0],
-				.signalSemaphoreCount = 0,
-				.pSignalSemaphores = nullptr
-			};
+			if (funcs[i].vkQueueSubmit(compute_queue[i], static_cast<std::uint32_t>(submit_infos[i].size()), submit_infos[i].data(), fence[i]) != VK_SUCCESS)
+				throw std::runtime_error("Failed to submit work!");
+		}
 
-			funcs[i].vkQueueSubmit(compute_queue[i], 1, &submit_info, fence[i]);
+		start_time = std::chrono::high_resolution_clock::now();
 
-			start_time = std::chrono::high_resolution_clock::now();
-
+		for (std::size_t i = 0; i < physical_devs.size(); i++) {
 			if (funcs[i].vkWaitForFences(dev[i], 1, &fence[i], VK_TRUE, std::numeric_limits<std::uint64_t>::max()) != VK_SUCCESS)
 				throw std::runtime_error("Failed to wait for fence! (work completion)");
 
-			end_time = std::chrono::high_resolution_clock::now();
-			ubo[i]->delta_time = std::chrono::duration_cast<std::chrono::duration<float>>(end_time - start_time).count();
+			funcs[i].vkResetFences(dev[i], 1, &fence[i]);
+			submit_infos[i][0].pWaitDstStageMask = &wait_stage_compute;
+		}
 
-			duration += ubo[i]->delta_time;
-			mean_sample += ubo[i]->delta_time;
-			num_samples++;
+		end_time = std::chrono::high_resolution_clock::now();
 
-			if (duration >= 10.f) {
-				duration = 0.f;
+		const auto delta_time = std::chrono::duration_cast<std::chrono::duration<float>>(end_time - start_time).count();
+		for (std::size_t i = 0; i < physical_devs.size(); i++)
+			ubo[i]->delta_time = delta_time;
 
-				const auto t = time(NULL);
-				const std::tm* timest = std::localtime(&t);
-				const float avg_dt = mean_sample / num_samples, avg_bps = 1.f / avg_dt;
-				mean_sample = 0.f;
-				num_samples = 0;
+		duration += delta_time;
+		mean_sample += delta_time;
+		num_samples++;
 
-				std::printf("DateTime:%d-%02d-%02d %02d:%02d:%02d AverageBodiesPerSecond (AverageBPS):%.02f\n", 1900 + timest->tm_year, 1 + timest->tm_mon, timest->tm_mday, timest->tm_hour, timest->tm_min, timest->tm_sec, avg_bps);
-			}
+		if (duration >= 10.f) {
+			duration = 0.f;
 
-			if (funcs[i].vkResetFences(dev[i], 1, &fence[i]) != VK_SUCCESS)
-				throw std::runtime_error("Failed to reset fence!");
+			const auto t = time(NULL);
+			const std::tm* timest = std::localtime(&t);
+			const float avg_dt = mean_sample / num_samples;
+			mean_sample = 0.f;
+			num_samples = 0;
+
+			std::printf("Date:%d-%02d-%02d Time:%02d:%02d:%02d AverageTime:%.02f sec\n", 1900 + timest->tm_year, 1 + timest->tm_mon, timest->tm_mday, timest->tm_hour, timest->tm_min, timest->tm_sec, avg_dt);
 		}
 	}
 
@@ -971,6 +996,9 @@ int main() {
 		funcs[i].vkDeviceWaitIdle(dev[i]);
 
 	for (std::size_t i = 0; i < physical_devs.size(); i++) {
+		for (std::size_t j = 0; j < semaphores[i].size(); j++)
+			funcs[i].vkDestroySemaphore(dev[i], semaphores[i][j], nullptr);
+
 		funcs[i].vkDestroyFence(dev[i], fence[i], nullptr);
 		funcs[i].vkDestroyCommandPool(dev[i], cmd_pool[i], nullptr);
 	}
