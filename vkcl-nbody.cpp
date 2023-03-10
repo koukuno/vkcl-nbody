@@ -721,7 +721,7 @@ static void create_fence(const VolkDeviceTable &funcs, VkDevice dev, VkFence &fe
 	const VkFenceCreateInfo create_info = {
 		.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
 		.pNext = nullptr,
-		.flags = 0
+		.flags = VK_FENCE_CREATE_SIGNALED_BIT
 	};
 
 	if (funcs.vkCreateFence(dev, &create_info, nullptr, &fence) != VK_SUCCESS)
@@ -867,11 +867,13 @@ int main(int argc, char *argv[]) {
 	std::vector<std::uint32_t> compute_queue_family_idx(physical_devs.size());
 	std::vector<VkQueue> compute_queue(physical_devs.size());
 
+	std::vector<std::chrono::high_resolution_clock::time_point> start_time(physical_devs.size()), end_time(physical_devs.size());
+	std::vector<float> duration(physical_devs.size(), 0.f), mean_sample(physical_devs.size(), 0.f);
+	std::vector<int> num_samples(physical_devs.size(), 0);
+	std::vector<bool> wait_for_copy(physical_devs.size(), true);
+
 	StdinMailbox mailbox;
-	std::chrono::high_resolution_clock::time_point start_time, end_time;
 	std::string line;
-	float duration = 0.f, mean_sample = 0.f;
-	int num_samples = 0;
 
 	for (std::size_t i = 0; i < physical_devs.size(); i++) {
 		create_device(physical_devs[i], dev[i], compute_queue_family_idx[i]);
@@ -976,40 +978,46 @@ int main(int argc, char *argv[]) {
 		}
 
 		for (std::size_t i = 0; i < physical_devs.size(); i++) {
-			if (funcs[i].vkQueueSubmit(compute_queue[i], static_cast<std::uint32_t>(submit_infos[i].size()), submit_infos[i].data(), fence[i]) != VK_SUCCESS)
-				throw std::runtime_error("Failed to submit work!");
-		}
+			const auto fence_status = funcs[i].vkGetFenceStatus(dev[i], fence[i]);
 
-		start_time = std::chrono::high_resolution_clock::now();
+			if (wait_for_copy[i])
+				start_time[i] = std::chrono::high_resolution_clock::now();
 
-		for (std::size_t i = 0; i < physical_devs.size(); i++) {
-			if (funcs[i].vkWaitForFences(dev[i], 1, &fence[i], VK_TRUE, std::numeric_limits<std::uint64_t>::max()) != VK_SUCCESS)
-				throw std::runtime_error("Failed to wait for fence! (work completion)");
+			if (fence_status == VK_SUCCESS) {
+				if (funcs[i].vkResetFences(dev[i], 1, &fence[i]) != VK_SUCCESS)
+					throw std::runtime_error("Failed to reset fence!");
 
-			funcs[i].vkResetFences(dev[i], 1, &fence[i]);
-			submit_infos[i][0].pWaitDstStageMask = &wait_stage_compute;
-		}
+				if (!wait_for_copy[i])
+					submit_infos[i][0].pWaitDstStageMask = &wait_stage_compute;
 
-		end_time = std::chrono::high_resolution_clock::now();
+				end_time[i] = std::chrono::high_resolution_clock::now();
+				const auto delta_time = std::chrono::duration_cast<std::chrono::duration<float>>(end_time[i] - start_time[i]).count();
 
-		const auto delta_time = std::chrono::duration_cast<std::chrono::duration<float>>(end_time - start_time).count();
-		for (std::size_t i = 0; i < physical_devs.size(); i++)
-			ubo[i]->delta_time = delta_time;
+				ubo[i]->delta_time = delta_time;
+				duration[i] += delta_time;
+				mean_sample[i] += delta_time;
+				num_samples[i]++;
 
-		duration += delta_time;
-		mean_sample += delta_time;
-		num_samples++;
+				if (duration[i] >= 10.f) {
+					duration[i] = 0.f;
 
-		if (duration >= 10.f) {
-			duration = 0.f;
+					const auto t = time(NULL);
+					const std::tm* timest = std::localtime(&t);
+					const float avg_dt = mean_sample[i] / num_samples[i];
+					mean_sample[i] = 0.f;
+					num_samples[i] = 0;
 
-			const auto t = time(NULL);
-			const std::tm* timest = std::localtime(&t);
-			const float avg_dt = mean_sample / num_samples;
-			mean_sample = 0.f;
-			num_samples = 0;
+					std::printf("Date:%d-%02d-%02d Time:%02d:%02d:%02d GPU:%zu AverageTime:%.02f sec\n", 1900 + timest->tm_year, 1 + timest->tm_mon, timest->tm_mday, timest->tm_hour, timest->tm_min, timest->tm_sec, i, avg_dt);
+				}
 
-			std::printf("Date:%d-%02d-%02d Time:%02d:%02d:%02d AverageTime:%.02f sec\n", 1900 + timest->tm_year, 1 + timest->tm_mon, timest->tm_mday, timest->tm_hour, timest->tm_min, timest->tm_sec, avg_dt);
+				start_time[i] = std::chrono::high_resolution_clock::now();
+				if (funcs[i].vkQueueSubmit(compute_queue[i], static_cast<std::uint32_t>(submit_infos[i].size()), submit_infos[i].data(), fence[i]) != VK_SUCCESS)
+					throw std::runtime_error("Failed to submit work!");
+
+				wait_for_copy[i] = false;
+			} else if (fence_status == VK_ERROR_DEVICE_LOST) {
+				throw std::runtime_error("Failed to query device fence status!");
+			}
 		}
 	}
 
