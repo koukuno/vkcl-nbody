@@ -53,13 +53,8 @@
 #endif
 #include "vk_mem_alloc.h"
 
-static const std::uint32_t particle_calculate_code[] =
-#include "particle_calculate.inc"
-;
-
-static const std::uint32_t particle_integrate_code[] =
-#include "particle_integrate.inc"
-;
+// glslangValidator --target-env vulkan1.0 --vn particle_attraction_code -V particle_attraction.comp -o particle_attraction.inc
+#include "particle_attraction.inc"
 
 union vec4 {
 	float data[4];
@@ -728,7 +723,7 @@ static void create_fence(const VolkDeviceTable &funcs, VkDevice dev, VkFence &fe
 		throw std::runtime_error("Cannot create VkSemaphore!");
 }
 
-static void record_cmd_buf_work(const VolkDeviceTable &funcs, VkCommandBuffer cmd_buf, VkPipeline pipeline_calculate, VkPipeline pipeline_integrate, VkPipelineLayout pipeline_layout, VkDescriptorSet desc_set, VkBuffer dev_buf, const VkDeviceSize dev_buf_storage_size, const std::uint32_t count) {
+static void record_cmd_buf_work(const VolkDeviceTable& funcs, VkCommandBuffer cmd_buf, VkPipeline particle_attraction, VkPipelineLayout pipeline_layout, VkDescriptorSet desc_set, VkBuffer dev_buf, const VkDeviceSize dev_buf_storage_size, const std::uint32_t count) {
 	const VkCommandBufferBeginInfo begin_info = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 		.pNext = nullptr,
@@ -736,26 +731,10 @@ static void record_cmd_buf_work(const VolkDeviceTable &funcs, VkCommandBuffer cm
 		.pInheritanceInfo = nullptr
 	};
 
-	const VkBufferMemoryBarrier storage_buf_mem_barrier = {
-		.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-		.pNext = nullptr,
-		.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-		.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		.buffer = dev_buf,
-		.offset = 0,
-		.size = dev_buf_storage_size
-	};
-
 	funcs.vkBeginCommandBuffer(cmd_buf, &begin_info);
-	funcs.vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_calculate);
+	funcs.vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, particle_attraction);
 	funcs.vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1, &desc_set, 0, nullptr);
-	funcs.vkCmdDispatch(cmd_buf, count, 1, 1);
-	funcs.vkCmdPipelineBarrier(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &storage_buf_mem_barrier, 0, nullptr);
-	funcs.vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_integrate);
-	funcs.vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1, &desc_set, 0, nullptr);
-	funcs.vkCmdDispatch(cmd_buf, count, 1, 1);
+	funcs.vkCmdDispatch(cmd_buf, count, count, 1);
 	funcs.vkEndCommandBuffer(cmd_buf);
 }
 
@@ -790,10 +769,8 @@ static auto get_random_seed() {
 }
 
 int main(int argc, char *argv[]) {
-	// TODO: perform heuristics for the ideal value OR let the user specify the "count" variable
-	// Right now, this value of 16384 pushes a 6900 XT and a couple A6000's to the limit.
-	static const std::uint32_t count = 16384;
-	static const std::size_t num_particles = count*1024;
+	static const std::uint32_t particles_per_workgroup = 4096;
+	static const std::size_t num_particles = particles_per_workgroup*8;
 
 	static const VkDeviceSize storage_buf_size = sizeof(Particle)*num_particles;
 	static const VkDeviceSize uniform_buf_size = sizeof(UBO);
@@ -847,7 +824,7 @@ int main(int argc, char *argv[]) {
 
 	std::vector<VkDescriptorSetLayout> desc_set_layout(physical_devs.size());
 	std::vector<VkPipelineLayout> pipeline_layout(physical_devs.size());
-	std::vector<VkPipeline> pipeline_calculate(physical_devs.size()), pipeline_integrate(physical_devs.size());
+	std::vector<VkPipeline> pipeline_attraction(physical_devs.size());
 
 	std::vector<VkDescriptorPool> desc_pool(physical_devs.size());
 	std::vector<VkDescriptorSet> desc_set(physical_devs.size());
@@ -867,7 +844,7 @@ int main(int argc, char *argv[]) {
 	std::vector<std::uint32_t> compute_queue_family_idx(physical_devs.size());
 	std::vector<VkQueue> compute_queue(physical_devs.size());
 
-	std::vector<std::chrono::high_resolution_clock::time_point> start_time(physical_devs.size()), end_time(physical_devs.size());
+	std::vector<std::chrono::high_resolution_clock::time_point> start_time(physical_devs.size(), std::chrono::high_resolution_clock::now()), end_time(physical_devs.size());
 	std::vector<float> duration(physical_devs.size(), 0.f), mean_sample(physical_devs.size(), 0.f);
 	std::vector<int> num_samples(physical_devs.size(), 0);
 	std::vector<bool> wait_for_copy(physical_devs.size(), true);
@@ -884,8 +861,7 @@ int main(int argc, char *argv[]) {
 
 	for (std::size_t i = 0; i < physical_devs.size(); i++) {
 		create_desc_and_pipeline_layout(funcs[i], dev[i], desc_set_layout[i], pipeline_layout[i]);
-		create_compute_pipeline(funcs[i], dev[i], pipeline_layout[i], particle_calculate_code, sizeof(particle_calculate_code), pipeline_calculate[i]);
-		create_compute_pipeline(funcs[i], dev[i], pipeline_layout[i], particle_integrate_code, sizeof(particle_integrate_code), pipeline_integrate[i]);
+		create_compute_pipeline(funcs[i], dev[i], pipeline_layout[i], particle_attraction_code, sizeof(particle_attraction_code), pipeline_attraction[i]);
 		create_desc_pool_and_set(funcs[i], dev[i], desc_set_layout[i], desc_pool[i], desc_set[i]);
 
 		create_dev_buf(allocator[i], dev_buf[i], dev_buf_alloc[i], storage_buf_size + uniform_buf_size);
@@ -898,7 +874,7 @@ int main(int argc, char *argv[]) {
 
 		record_cmd_buf_copy(funcs[i], cmd_bufs[i][cmd_bufs[i].size() - 1], host_buf[i], dev_buf[i], storage_buf_size);
 		for (std::size_t j = 0; j < cmd_bufs[i].size() - 1; j++)
-			record_cmd_buf_work(funcs[i], cmd_bufs[i][j], pipeline_calculate[i], pipeline_integrate[i], pipeline_layout[i], desc_set[i], dev_buf[i], storage_buf_size, count);
+			record_cmd_buf_work(funcs[i], cmd_bufs[i][j], pipeline_attraction[i], pipeline_layout[i], desc_set[i], dev_buf[i], storage_buf_size, particles_per_workgroup);
 
 		create_fence(funcs[i], dev[i], fence[i]);
 
@@ -956,13 +932,7 @@ int main(int argc, char *argv[]) {
 
 			if (funcs[i].vkQueueSubmit(compute_queue[i], 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS)
 				throw std::runtime_error("Cannot copy init data!");
-#if 0
-			if (funcs[i].vkWaitForFences(dev[i], 1, &fence[i], VK_TRUE, std::numeric_limits<std::uint64_t>::max()) != VK_SUCCESS)
-				throw std::runtime_error("Failed to wait for fence! (copy completion)");
 
-			if (funcs[i].vkResetFences(dev[i], 1, &fence[i]) != VK_SUCCESS)
-				throw std::runtime_error("Failed to reset fence!");
-#endif
 			submit_infos[i][0].pWaitDstStageMask = &wait_stage_transfer;
 		}
 
@@ -979,9 +949,6 @@ int main(int argc, char *argv[]) {
 
 		for (std::size_t i = 0; i < physical_devs.size(); i++) {
 			const auto fence_status = funcs[i].vkGetFenceStatus(dev[i], fence[i]);
-
-			if (wait_for_copy[i])
-				start_time[i] = std::chrono::high_resolution_clock::now();
 
 			if (fence_status == VK_SUCCESS) {
 				if (funcs[i].vkResetFences(dev[i], 1, &fence[i]) != VK_SUCCESS)
@@ -1021,8 +988,10 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
-	for (std::size_t i = 0; i < physical_devs.size(); i++)
+	for (std::size_t i = 0; i < physical_devs.size(); i++) {
 		funcs[i].vkDeviceWaitIdle(dev[i]);
+		funcs[i].vkWaitForFences(dev[i], 1, &fence[i], VK_TRUE, std::numeric_limits<std::uint64_t>::max());
+	}
 
 	for (std::size_t i = 0; i < physical_devs.size(); i++) {
 		for (std::size_t j = 0; j < semaphores[i].size(); j++)
@@ -1040,8 +1009,7 @@ int main(int argc, char *argv[]) {
 
 	for (std::size_t i = 0; i < physical_devs.size(); i++) {
 		funcs[i].vkDestroyDescriptorPool(dev[i], desc_pool[i], nullptr);
-		funcs[i].vkDestroyPipeline(dev[i], pipeline_calculate[i], nullptr);
-		funcs[i].vkDestroyPipeline(dev[i], pipeline_integrate[i], nullptr);
+		funcs[i].vkDestroyPipeline(dev[i], pipeline_attraction[i], nullptr);
 		funcs[i].vkDestroyPipelineLayout(dev[i], pipeline_layout[i], nullptr);
 		funcs[i].vkDestroyDescriptorSetLayout(dev[i], desc_set_layout[i], nullptr);
 	}

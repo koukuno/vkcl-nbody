@@ -1,0 +1,54 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+struct Particle {
+	vec4 position;
+	vec4 velocity;
+};
+
+layout(set = 0, binding = 0, std430) buffer bodybuf {
+	Particle particles[];
+} buf;
+
+// we have to hard code the number of particles into the compute shader
+// for maximum performance
+// accessing particle_count in the UBO causes a perf hit
+layout(binding = 1) uniform UBO {
+	float delta_time;
+	uint particle_count;
+} ubo;
+
+vec4 attract_two_particles(Particle a, Particle b) {
+	vec3 len = b.position.xyz - a.position.xyz;
+	vec3 _54 = (((len * 0.004300910048186779022216796875)) / vec3(pow(dot(len, len) + 9.9999997473787516355514526367188e-06, 0.75))) * 9.9999999747524270787835121154785e-07;
+	vec4 accel;
+	accel = vec4(_54.x, _54.y, _54.z, accel.w)*ubo.delta_time;
+	return accel;
+}
+
+void main() {
+	bool _67 = gl_GlobalInvocationID.x >= 32768u, _75;
+
+	if (!_67) {
+		_75 = gl_GlobalInvocationID.y >= 32768u;
+	} else {
+		_75 = _67;
+	}
+
+	if (_75) {
+		return;
+	}
+
+	Particle p1, p2;
+	for (uint j = 0; j < 8u; j++) {
+		p1.position = buf.particles[gl_GlobalInvocationID.x].position;
+		p1.velocity = buf.particles[gl_GlobalInvocationID.x].velocity;
+
+		p2.position = buf.particles[j].position;
+		p2.velocity = buf.particles[j].velocity;
+
+		buf.particles[gl_GlobalInvocationID.x].velocity += attract_two_particles(p1, p2);
+		buf.particles[gl_GlobalInvocationID.x].position += buf.particles[gl_GlobalInvocationID.x].velocity;
+	}
+}
+
