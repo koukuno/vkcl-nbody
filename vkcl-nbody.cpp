@@ -789,7 +789,7 @@ static auto get_random_seed() {
 	return std::seed_seq(random_data.begin(), random_data.end());
 }
 
-int main() {
+int main(int argc, char *argv[]) {
 	// TODO: perform heuristics for the ideal value OR let the user specify the "count" variable
 	// Right now, this value of 16384 pushes a 6900 XT and a couple A6000's to the limit.
 	static const std::uint32_t count = 16384;
@@ -808,7 +808,28 @@ int main() {
 	VkDebugUtilsMessengerEXT debug_msgr = VK_NULL_HANDLE;
 	std::vector<VkPhysicalDevice> present_physical_devs, physical_devs;
 
-	create_vkinstance(inst, debug_msgr, false);
+	struct {
+		bool debug_mode = false;
+	} cli_options;
+
+	for (int i = 1; i < argc; i++) {
+		const std::string_view arg(argv[i]);
+
+		if (arg == "-help") {
+			std::printf(
+				"usage: vkcl-nbody [-help] [-debug]\n"
+				"-help: Display help information\n"
+				"-debug: Enable Vulkan validation layers if found\n"
+			);
+
+			return 0;
+		}
+		else if (arg == "-debug") {
+			cli_options.debug_mode = true;
+		}
+	}
+
+	create_vkinstance(inst, debug_msgr, cli_options.debug_mode);
 	get_physical_devs(inst, present_physical_devs);
 	//physical_dev = physical_devs[select_device_prompt(physical_devs)];
 
