@@ -25,6 +25,7 @@
  * For more information, please refer to <http://unlicense.org/>
  */
 
+// TODO: create a thread and book-keeping for each device.
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -120,8 +121,7 @@ static VkBool32 vulkan_debug_utils_messenger(VkDebugUtilsMessageSeverityFlagBits
 	(void)msg_type;
 	(void)user_data;
 
-	if (msg_type >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
-		std::printf("VulkanAPI: %s\n", callback_data->pMessage);
+	std::printf("VulkanAPI: %s\n", callback_data->pMessage);
 
 	return VK_FALSE;
 }
@@ -228,7 +228,7 @@ static void create_vkinstance(VkInstance &inst, VkDebugUtilsMessengerEXT &debug_
 		.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
 		.pNext = nullptr,
 		.flags = 0,
-		.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+		.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
 		.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
 		.pfnUserCallback = vulkan_debug_utils_messenger,
 		.pUserData = nullptr
@@ -246,7 +246,7 @@ static void create_vkinstance(VkInstance &inst, VkDebugUtilsMessengerEXT &debug_
 	std::vector<VkLayerProperties> avail_layer_props;
 	std::uint32_t vk_obj_count;
 
-	std::set<const char *> layers_support, exts_support = { VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME };
+	std::set<const char *> layers_support, exts_support = { VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME, "VK_KHR_portability_enumeration" };
 	std::vector<const char *> layers_enable, exts_enable;
 
 	if (volkInitialize() != VK_SUCCESS)
@@ -284,7 +284,7 @@ static void create_vkinstance(VkInstance &inst, VkDebugUtilsMessengerEXT &debug_
 	}
 
 	if (!search_valid_layer && debug_mode)
-		std::printf("!! Vulkan Validation Layers requested, but not found");
+		std::printf("!! Vulkan Validation Layers requested, but not found\n");
 
 	if (layers_support.size() > 0) {
 		layers_enable.resize(layers_support.size());
@@ -299,7 +299,7 @@ static void create_vkinstance(VkInstance &inst, VkDebugUtilsMessengerEXT &debug_
 	const VkInstanceCreateInfo create_info = {
 		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
 		.pNext = supp_debug_mode ? &valid_features : nullptr,
-		.flags = 0,
+		.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR,
 		.pApplicationInfo = &app_info,
 		.enabledLayerCount = static_cast<std::uint32_t>(layers_enable.size()),
 		.ppEnabledLayerNames = layers_enable.size() > 0 ? layers_enable.data() : nullptr,
@@ -329,7 +329,7 @@ static void get_physical_devs(VkInstance inst, std::vector<VkPhysicalDevice> &ph
 	vkEnumeratePhysicalDevices(inst, &count, physical_devs.data());
 }
 
-static void create_device(VkPhysicalDevice physical_dev, VkDevice &dev, std::uint32_t &compute_queue_family_idx) {
+static void create_device(VkPhysicalDevice physical_dev, VkDevice &dev, std::uint32_t &compute_queue_family_idx, std::uint32_t &transfer_queue_family_idx, std::uint32_t &transfer_queue_idx) {
 	static const float priority = 1.f;
 
 	std::uint32_t count;
@@ -339,36 +339,63 @@ static void create_device(VkPhysicalDevice physical_dev, VkDevice &dev, std::uin
 	vkGetPhysicalDeviceQueueFamilyProperties(physical_dev, &count, queue_families.data());
 
 	compute_queue_family_idx = std::numeric_limits<std::uint32_t>::max();
+	transfer_queue_family_idx = std::numeric_limits<std::uint32_t>::max();
+	transfer_queue_idx = 0;
 
 	for (std::size_t i = 0; i < queue_families.size(); i++) {
-		if (queue_families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+		if (compute_queue_family_idx == std::numeric_limits<std::uint32_t>::max() && (queue_families[i].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
 			compute_queue_family_idx = static_cast<std::uint32_t>(i);
-			break;
+			continue;
+		}
+
+		if (transfer_queue_family_idx == std::numeric_limits<std::uint32_t>::max() && (queue_families[i].queueFlags & VK_QUEUE_TRANSFER_BIT)) {
+			transfer_queue_family_idx = static_cast<std::uint32_t>(i);
+			continue;
 		}
 	}
 
 	if (compute_queue_family_idx == std::numeric_limits<std::uint32_t>::max())
 		throw std::runtime_error("No compute queue found!");
 
-	const VkDeviceQueueCreateInfo queue = {
-		.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-		.pNext = nullptr,
-		.flags = 0,
-		.queueFamilyIndex = compute_queue_family_idx,
-		.queueCount = 1,
-		.pQueuePriorities = &priority
+	if (transfer_queue_family_idx == std::numeric_limits<std::uint32_t>::max()) {
+		std::printf("! No pure transfer queue family found, falling back to extra compute queue\n");
+		transfer_queue_family_idx = compute_queue_family_idx;
+		transfer_queue_idx = 1;
+	}
+
+	const std::array<VkDeviceQueueCreateInfo, 2> queue_create_infos = {
+		VkDeviceQueueCreateInfo {
+			.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+			.pNext = nullptr,
+			.flags = 0,
+			.queueFamilyIndex = compute_queue_family_idx,
+			.queueCount = 1,
+			.pQueuePriorities = &priority
+		},
+		VkDeviceQueueCreateInfo {
+			.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+			.pNext = nullptr,
+			.flags = 0,
+			.queueFamilyIndex = transfer_queue_family_idx,
+			.queueCount = 1,
+			.pQueuePriorities = &priority
+		}
+	};
+
+	static constinit std::array<const char *, 1> device_exts = {
+		"VK_KHR_portability_subset"
 	};
 
 	const VkDeviceCreateInfo create_info = {
 		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
 		.pNext = nullptr,
 		.flags = 0,
-		.queueCreateInfoCount = 1,
-		.pQueueCreateInfos = &queue,
+		.queueCreateInfoCount = static_cast<std::uint32_t>(queue_create_infos.size()),
+		.pQueueCreateInfos = queue_create_infos.data(),
 		.enabledLayerCount = 0,
 		.ppEnabledLayerNames = nullptr,
-		.enabledExtensionCount = 0,
-		.ppEnabledExtensionNames = nullptr,
+		.enabledExtensionCount = static_cast<std::uint32_t>(device_exts.size()),
+		.ppEnabledExtensionNames = device_exts.data(),
 		.pEnabledFeatures = nullptr
 	};
 
@@ -632,12 +659,12 @@ static void create_host_buf(VmaAllocator allocator, VkBuffer &buf, VmaAllocation
 	pbuf = reinterpret_cast<T *>(info.pMappedData);
 }
 
-static void create_cmd_pool(const VolkDeviceTable &funcs, VkDevice dev, const uint32_t compute_queue_family_idx, VkCommandPool &cmd_pool) {
+static void create_cmd_pool(const VolkDeviceTable &funcs, VkDevice dev, const uint32_t queue_family_idx, VkCommandPool &cmd_pool) {
 	const VkCommandPoolCreateInfo create_info = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
 		.pNext = nullptr,
 		.flags = 0,
-		.queueFamilyIndex = compute_queue_family_idx
+		.queueFamilyIndex = queue_family_idx
 	};
 
 	if (funcs.vkCreateCommandPool(dev, &create_info, nullptr, &cmd_pool) != VK_SUCCESS)
@@ -723,7 +750,7 @@ static void create_fence(const VolkDeviceTable &funcs, VkDevice dev, VkFence &fe
 		throw std::runtime_error("Cannot create VkSemaphore!");
 }
 
-static void record_cmd_buf_work(const VolkDeviceTable& funcs, VkCommandBuffer cmd_buf, VkPipeline particle_attraction, VkPipelineLayout pipeline_layout, VkDescriptorSet desc_set, VkBuffer dev_buf, const VkDeviceSize dev_buf_storage_size, const std::uint32_t count) {
+static void record_cmd_buf_work(const VolkDeviceTable& funcs, VkCommandBuffer cmd_buf, VkPipeline particle_attraction, VkPipelineLayout pipeline_layout, VkDescriptorSet desc_set, VkBuffer dev_buf, const VkDeviceSize dev_buf_size, const std::uint32_t count, const std::uint32_t compute_queue_family_idx, const std::uint32_t transfer_queue_family_idx) {
 	const VkCommandBufferBeginInfo begin_info = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 		.pNext = nullptr,
@@ -731,14 +758,44 @@ static void record_cmd_buf_work(const VolkDeviceTable& funcs, VkCommandBuffer cm
 		.pInheritanceInfo = nullptr
 	};
 
+	const VkBufferMemoryBarrier host_to_dev_buf_mem_barrier = {
+		.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+		.pNext = nullptr,
+		.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		.srcQueueFamilyIndex = transfer_queue_family_idx,
+		.dstQueueFamilyIndex = compute_queue_family_idx,
+		.buffer = dev_buf,
+		.offset = 0,
+		.size = dev_buf_size
+	};
+
+	const VkBufferMemoryBarrier dev_to_host_buf_mem_barrier = {
+		.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+		.pNext = nullptr,
+		.srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		.srcQueueFamilyIndex = compute_queue_family_idx,
+		.dstQueueFamilyIndex = transfer_queue_family_idx,
+		.buffer = dev_buf,
+		.offset = 0,
+		.size = dev_buf_size
+	};
+
 	funcs.vkBeginCommandBuffer(cmd_buf, &begin_info);
+
+	funcs.vkCmdPipelineBarrier(cmd_buf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &host_to_dev_buf_mem_barrier, 0, nullptr);
+
 	funcs.vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, particle_attraction);
 	funcs.vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1, &desc_set, 0, nullptr);
 	funcs.vkCmdDispatch(cmd_buf, count, count, 1);
+
+	funcs.vkCmdPipelineBarrier(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &dev_to_host_buf_mem_barrier, 0, nullptr);
+
 	funcs.vkEndCommandBuffer(cmd_buf);
 }
 
-static void record_cmd_buf_copy(const VolkDeviceTable &funcs, VkCommandBuffer cmd_buf, VkBuffer host_buf, VkBuffer dev_buf, const VkDeviceSize size) {
+static void record_cmd_buf_copy_host_to_dev(const VolkDeviceTable &funcs, VkCommandBuffer cmd_buf, VkBuffer host_buf, VkBuffer dev_buf, const VkDeviceSize size, const std::uint32_t compute_queue_family_idx, const std::uint32_t transfer_queue_family_idx) {
 	const VkCommandBufferBeginInfo begin_info = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 		.pNext = nullptr,
@@ -752,8 +809,66 @@ static void record_cmd_buf_copy(const VolkDeviceTable &funcs, VkCommandBuffer cm
 		.size = size
 	};
 
+	const VkBufferMemoryBarrier host_to_dev_buf_mem_barrier = {
+		.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+		.pNext = nullptr,
+		.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		.srcQueueFamilyIndex = transfer_queue_family_idx,
+		.dstQueueFamilyIndex = compute_queue_family_idx,
+		.buffer = dev_buf,
+		.offset = 0,
+		.size = size
+	};
+
 	funcs.vkBeginCommandBuffer(cmd_buf, &begin_info);
 	funcs.vkCmdCopyBuffer(cmd_buf, host_buf, dev_buf, 1, &region);
+	funcs.vkCmdPipelineBarrier(cmd_buf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &host_to_dev_buf_mem_barrier, 0, nullptr);
+	funcs.vkEndCommandBuffer(cmd_buf);
+}
+
+static void record_cmd_buf_copy_dev_to_host(const VolkDeviceTable &funcs, VkCommandBuffer cmd_buf, VkBuffer host_buf, VkBuffer dev_buf, const VkDeviceSize size, const std::uint32_t compute_queue_family_idx, const std::uint32_t transfer_queue_family_idx) {
+	const VkCommandBufferBeginInfo begin_info = {
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+		.pNext = nullptr,
+		.flags = 0,
+		.pInheritanceInfo = nullptr
+	};
+
+	const VkBufferCopy region = {
+		.srcOffset = 0,
+		.dstOffset = 0,
+		.size = size
+	};
+
+	const VkBufferMemoryBarrier dev_to_host_buf_mem_barrier = {
+		.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+		.pNext = nullptr,
+		.srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		.srcQueueFamilyIndex = compute_queue_family_idx,
+		.dstQueueFamilyIndex = transfer_queue_family_idx,
+		.buffer = dev_buf,
+		.offset = 0,
+		.size = size
+	};
+
+	const VkBufferMemoryBarrier host_to_dev_buf_mem_barrier = {
+		.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+		.pNext = nullptr,
+		.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		.srcQueueFamilyIndex = transfer_queue_family_idx,
+		.dstQueueFamilyIndex = compute_queue_family_idx,
+		.buffer = dev_buf,
+		.offset = 0,
+		.size = size
+	};
+
+	funcs.vkBeginCommandBuffer(cmd_buf, &begin_info);
+	funcs.vkCmdPipelineBarrier(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &dev_to_host_buf_mem_barrier, 0, nullptr);
+	funcs.vkCmdCopyBuffer(cmd_buf, dev_buf, host_buf, 1, &region);
+	funcs.vkCmdPipelineBarrier(cmd_buf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &host_to_dev_buf_mem_barrier, 0, nullptr);
 	funcs.vkEndCommandBuffer(cmd_buf);
 }
 
@@ -776,10 +891,11 @@ int main(int argc, char *argv[]) {
 	static const VkDeviceSize uniform_buf_size = sizeof(UBO);
 
 	static const VkPipelineStageFlags wait_stage_transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
+	static const VkPipelineStageFlags wait_stage_compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
 
 	static auto seed = get_random_seed();
 	static std::default_random_engine rng(seed);
-	std::uniform_real_distribution<float> dist(0.0, 1000.0);
+	std::uniform_real_distribution<float> dist(-1.f, 1.f);
 
 	VkInstance inst;
 	VkDebugUtilsMessengerEXT debug_msgr = VK_NULL_HANDLE;
@@ -834,14 +950,18 @@ int main(int argc, char *argv[]) {
 	std::vector<Particle *> particles(physical_devs.size()); // from host_buf memory
 	std::vector<UBO *> ubo(physical_devs.size()); // from uniform_buf memory
 
-	std::vector<VkCommandPool> cmd_pool(physical_devs.size());
-	std::vector<std::array<VkCommandBuffer, 2>> cmd_bufs(physical_devs.size());
+	std::vector<VkCommandPool> compute_cmd_pool(physical_devs.size()), transfer_cmd_pool(physical_devs.size());
+	std::vector<std::array<VkCommandBuffer, 1>> compute_cmd_bufs(physical_devs.size());
 
-	std::vector<VkFence> fence(physical_devs.size());
-	std::vector<VkSemaphore> copy_semaphore(physical_devs.size());
+	// 0: HOST->DEV, 1: DEV->HOST
+	std::vector<std::array<VkCommandBuffer, 2>> transfer_cmd_bufs(physical_devs.size());
 
-	std::vector<std::uint32_t> compute_queue_family_idx(physical_devs.size());
+	std::vector<VkFence> compute_fence(physical_devs.size()), dev_to_host_copy_fence(physical_devs.size());
+	std::vector<VkSemaphore> copy_host_to_dev_semaphore(physical_devs.size()), copy_dev_to_host_semaphore(physical_devs.size()), compute_fin_semaphore(physical_devs.size());
+
+	std::vector<std::uint32_t> compute_queue_family_idx(physical_devs.size()), transfer_queue_family_idx(physical_devs.size()), transfer_queue_idx(physical_devs.size());
 	std::vector<VkQueue> compute_queue(physical_devs.size());
+	std::vector<VkQueue> transfer_queue(physical_devs.size());
 
 	std::vector<std::chrono::high_resolution_clock::time_point> start_time(physical_devs.size(), std::chrono::high_resolution_clock::now()), end_time(physical_devs.size());
 	std::vector<float> duration(physical_devs.size(), 0.f), mean_sample(physical_devs.size(), 0.f);
@@ -852,9 +972,10 @@ int main(int argc, char *argv[]) {
 	std::string line;
 
 	for (std::size_t i = 0; i < physical_devs.size(); i++) {
-		create_device(physical_devs[i], dev[i], compute_queue_family_idx[i]);
+		create_device(physical_devs[i], dev[i], compute_queue_family_idx[i], transfer_queue_family_idx[i], transfer_queue_idx[i]);
 		volkLoadDeviceTable(&funcs[i], dev[i]);
 		funcs[i].vkGetDeviceQueue(dev[i], compute_queue_family_idx[i], 0, &compute_queue[i]);
+		funcs[i].vkGetDeviceQueue(dev[i], transfer_queue_family_idx[i], transfer_queue_idx[i], &transfer_queue[i]);
 		create_allocator(funcs[i], inst, physical_devs[i], dev[i], allocator[i]);
 	}
 
@@ -868,14 +989,20 @@ int main(int argc, char *argv[]) {
 		create_uniform_buf(allocator[i], uniform_buf[i], uniform_buf_alloc[i], ubo[i], uniform_buf_size);
 		update_desc_set(funcs[i], dev[i], desc_set[i], dev_buf[i], uniform_buf[i], storage_buf_size, uniform_buf_size);
 
-		create_cmd_pool(funcs[i], dev[i], compute_queue_family_idx[i], cmd_pool[i]);
-		create_cmd_bufs(funcs[i], dev[i], cmd_pool[i], cmd_bufs[i]);
+		create_cmd_pool(funcs[i], dev[i], compute_queue_family_idx[i], compute_cmd_pool[i]);
+		create_cmd_pool(funcs[i], dev[i], transfer_queue_family_idx[i], transfer_cmd_pool[i]);
+		create_cmd_bufs(funcs[i], dev[i], compute_cmd_pool[i], compute_cmd_bufs[i]);
+		create_cmd_bufs(funcs[i], dev[i], transfer_cmd_pool[i], transfer_cmd_bufs[i]);
 
-		record_cmd_buf_copy(funcs[i], cmd_bufs[i][0], host_buf[i], dev_buf[i], storage_buf_size);
-		record_cmd_buf_work(funcs[i], cmd_bufs[i][1], pipeline_attraction[i], pipeline_layout[i], desc_set[i], dev_buf[i], storage_buf_size, particles_per_workgroup);
+		record_cmd_buf_copy_host_to_dev(funcs[i], transfer_cmd_bufs[i][0], host_buf[i], dev_buf[i], storage_buf_size, compute_queue_family_idx[i], transfer_queue_family_idx[i]);
+		record_cmd_buf_copy_dev_to_host(funcs[i], transfer_cmd_bufs[i][1], host_buf[i], dev_buf[i], storage_buf_size, compute_queue_family_idx[i], transfer_queue_family_idx[i]);
+		record_cmd_buf_work(funcs[i], compute_cmd_bufs[i][0], pipeline_attraction[i], pipeline_layout[i], desc_set[i], dev_buf[i], storage_buf_size, particles_per_workgroup, compute_queue_family_idx[i], transfer_queue_family_idx[i]);
 
-		create_fence(funcs[i], dev[i], fence[i]);
-		create_semaphore(funcs[i], dev[i], copy_semaphore[i]);
+		create_fence(funcs[i], dev[i], compute_fence[i]);
+		create_fence(funcs[i], dev[i], dev_to_host_copy_fence[i]);
+		create_semaphore(funcs[i], dev[i], copy_host_to_dev_semaphore[i]);
+		create_semaphore(funcs[i], dev[i], copy_dev_to_host_semaphore[i]);
+		create_semaphore(funcs[i], dev[i], compute_fin_semaphore[i]);
 	}
 
 	for (std::size_t i = 0; i < physical_devs.size(); i++) {
@@ -903,12 +1030,12 @@ int main(int argc, char *argv[]) {
 				.pWaitSemaphores = nullptr,
 				.pWaitDstStageMask = nullptr,
 				.commandBufferCount = 1,
-				.pCommandBuffers = &cmd_bufs[i][0],
+				.pCommandBuffers = &transfer_cmd_bufs[i][0],
 				.signalSemaphoreCount = 1,
-				.pSignalSemaphores = &copy_semaphore[i]
+				.pSignalSemaphores = &copy_host_to_dev_semaphore[i]
 			};
 
-			if (funcs[i].vkQueueSubmit(compute_queue[i], 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS)
+			if (funcs[i].vkQueueSubmit(transfer_queue[i], 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS)
 				throw std::runtime_error("Cannot copy init data!");
 		}
 
@@ -919,16 +1046,34 @@ int main(int argc, char *argv[]) {
 
 	while (true) {
 		if (mailbox.get_input(line)) {
-			if (line == "quit")
+			if (line == "quit") {
 				break;
+			} else if (line == "dump") {
+				for (std::size_t i = 0; i < physical_devs.size(); i++) {
+					std::printf("GPU:%zu Particle:0 Position:%.2f %.2f %.2f Velocity:%.2f %.2f %.2f %.2f\n",
+						i,
+						particles[i][0].position.components.x,
+						particles[i][0].position.components.y,
+						particles[i][0].position.components.z,
+						particles[i][0].velocity.components.x,
+						particles[i][0].velocity.components.y,
+						particles[i][0].velocity.components.z,
+						particles[i][0].velocity.components.w
+					);
+				}
+			}
 		}
 
 		for (std::size_t i = 0; i < physical_devs.size(); i++) {
-			const auto fence_status = funcs[i].vkGetFenceStatus(dev[i], fence[i]);
+			const auto compute_fence_status = funcs[i].vkGetFenceStatus(dev[i], compute_fence[i]);
+			const auto dev_to_host_copy_fence_status = funcs[i].vkGetFenceStatus(dev[i], dev_to_host_copy_fence[i]);
 
-			if (fence_status == VK_SUCCESS) {
-				if (funcs[i].vkResetFences(dev[i], 1, &fence[i]) != VK_SUCCESS)
-					throw std::runtime_error("Failed to reset fence!");
+			if (compute_fence_status == VK_SUCCESS && dev_to_host_copy_fence_status == VK_SUCCESS) {
+				if (funcs[i].vkResetFences(dev[i], 1, &compute_fence[i]) != VK_SUCCESS)
+					throw std::runtime_error("Failed to reset compute fence!");
+
+				if (funcs[i].vkResetFences(dev[i], 1, &dev_to_host_copy_fence[i]) != VK_SUCCESS)
+					throw std::runtime_error("Failed to reset compute fence!");
 
 				end_time[i] = std::chrono::high_resolution_clock::now();
 				const auto delta_time = std::chrono::duration_cast<std::chrono::duration<float>>(end_time[i] - start_time[i]).count();
@@ -950,38 +1095,58 @@ int main(int argc, char *argv[]) {
 					std::printf("Date:%d-%02d-%02d Time:%02d:%02d:%02d GPU:%zu AverageTime:%.04f sec AverageSimulationsPerSec:%.02f\n", 1900 + timest->tm_year, 1 + timest->tm_mon, timest->tm_mday, timest->tm_hour, timest->tm_min, timest->tm_sec, i, avg_dt, 1.f/avg_dt);
 				}
 
-				const VkSubmitInfo submit_info = {
+				const VkSubmitInfo compute_submit_info = {
 					.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
 					.pNext = nullptr,
-					.waitSemaphoreCount = wait_for_copy[i] ? 1u : 0u,
-					.pWaitSemaphores = wait_for_copy[i] ? &copy_semaphore[i] : nullptr,
-					.pWaitDstStageMask = wait_for_copy[i] ? &wait_stage_transfer : nullptr,
-					.commandBufferCount = 1,
-					.pCommandBuffers = &cmd_bufs[i][1],
-					.signalSemaphoreCount = 0,
-					.pSignalSemaphores = nullptr
+					.waitSemaphoreCount = 1u,
+					.pWaitSemaphores = wait_for_copy[i] ? &copy_host_to_dev_semaphore[i] : &copy_dev_to_host_semaphore[i],
+					.pWaitDstStageMask = &wait_stage_transfer,
+					.commandBufferCount = 1u,
+					.pCommandBuffers = &compute_cmd_bufs[i][0],
+					.signalSemaphoreCount = 1u,
+					.pSignalSemaphores = &compute_fin_semaphore[i]
+				};
+
+				const VkSubmitInfo transfer_submit_info = {
+					.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+					.pNext = nullptr,
+					.waitSemaphoreCount = 1u,
+					.pWaitSemaphores = &compute_fin_semaphore[i],
+					.pWaitDstStageMask = &wait_stage_compute,
+					.commandBufferCount = 1u,
+					.pCommandBuffers = &transfer_cmd_bufs[i][1],
+					.signalSemaphoreCount = 1u,
+					.pSignalSemaphores = &copy_dev_to_host_semaphore[i]
 				};
 
 				start_time[i] = std::chrono::high_resolution_clock::now();
-				if (funcs[i].vkQueueSubmit(compute_queue[i], 1, &submit_info, fence[i]) != VK_SUCCESS)
+				if (funcs[i].vkQueueSubmit(compute_queue[i], 1, &compute_submit_info, compute_fence[i]) != VK_SUCCESS)
 					throw std::runtime_error("Failed to submit work!");
 
+				if (funcs[i].vkQueueSubmit(transfer_queue[i], 1, &transfer_submit_info, dev_to_host_copy_fence[i]) != VK_SUCCESS)
+					throw std::runtime_error("Failed to submit DEV->CPU copy!");
+
 				wait_for_copy[i] = false;
-			} else if (fence_status == VK_ERROR_DEVICE_LOST) {
+			} else if (compute_fence_status == VK_ERROR_DEVICE_LOST || dev_to_host_copy_fence_status == VK_ERROR_DEVICE_LOST) {
 				throw std::runtime_error("Failed to query device fence status!");
 			}
 		}
 	}
 
 	for (std::size_t i = 0; i < physical_devs.size(); i++) {
-		funcs[i].vkWaitForFences(dev[i], 1, &fence[i], VK_TRUE, std::numeric_limits<std::uint64_t>::max());
+		funcs[i].vkWaitForFences(dev[i], 1, &compute_fence[i], VK_TRUE, std::numeric_limits<std::uint64_t>::max());
+		funcs[i].vkWaitForFences(dev[i], 1, &dev_to_host_copy_fence[i], VK_TRUE, std::numeric_limits<std::uint64_t>::max());
 		funcs[i].vkDeviceWaitIdle(dev[i]);
 	}
 
 	for (std::size_t i = 0; i < physical_devs.size(); i++) {
-		funcs[i].vkDestroySemaphore(dev[i], copy_semaphore[i], nullptr);
-		funcs[i].vkDestroyFence(dev[i], fence[i], nullptr);
-		funcs[i].vkDestroyCommandPool(dev[i], cmd_pool[i], nullptr);
+		funcs[i].vkDestroySemaphore(dev[i], copy_host_to_dev_semaphore[i], nullptr);
+		funcs[i].vkDestroySemaphore(dev[i], copy_dev_to_host_semaphore[i], nullptr);
+		funcs[i].vkDestroySemaphore(dev[i], compute_fin_semaphore[i], nullptr);
+		funcs[i].vkDestroyFence(dev[i], compute_fence[i], nullptr);
+		funcs[i].vkDestroyFence(dev[i], dev_to_host_copy_fence[i], nullptr);
+		funcs[i].vkDestroyCommandPool(dev[i], compute_cmd_pool[i], nullptr);
+		funcs[i].vkDestroyCommandPool(dev[i], transfer_cmd_pool[i], nullptr);
 	}
 
 	for (std::size_t i = 0; i < physical_devs.size(); i++) {
